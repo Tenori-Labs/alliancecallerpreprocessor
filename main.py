@@ -12,8 +12,17 @@ import tarfile
 import shutil
 import threading
 import time
+import atexit
 from datetime import datetime
 from enum import Enum
+from urllib.parse import urlparse, parse_qs, unquote
+
+try:
+    from pyngrok import ngrok
+    PYNGROK_AVAILABLE = True
+except ImportError:
+    PYNGROK_AVAILABLE = False
+    print("⚠️  pyngrok not found. Install with: pip install pyngrok")
 
 try:
     import fitz  # PyMuPDF.
@@ -180,6 +189,75 @@ extraction_lock = threading.Lock()  # Lock to protect extraction_in_progress fla
 _cached_pdf_names = set()
 _pdf_names_cache_lock = threading.Lock()
 _pdf_names_cache_valid = False  # Flag to indicate if cache needs refresh
+
+# Ngrok tunnel variable
+ngrok_tunnel = None
+
+
+def start_ngrok_tunnel(port=8080):
+    """Start ngrok tunnel for the FastAPI service"""
+    global ngrok_tunnel
+    
+    if not PYNGROK_AVAILABLE:
+        print("⚠️  pyngrok not available, skipping ngrok tunnel")
+        return None
+    
+    ngrok_auth_token = os.getenv("NGROK_AUTH_TOKEN")
+    
+    if ngrok_auth_token:
+        try:
+            ngrok.set_auth_token(ngrok_auth_token)
+            print("✓ Using ngrok auth token from environment")
+        except Exception as e:
+            print(f"⚠️  Failed to set ngrok auth token: {e}")
+    else:
+        print("⚠️  NGROK_AUTH_TOKEN not set, using free ngrok (may have limitations)")
+    
+    try:
+        ngrok_tunnel = ngrok.connect(port, "http")
+        public_url = ngrok_tunnel.public_url
+        
+        print("\n" + "="*80)
+        print("🚀 ngrok tunnel started successfully!")
+        print(f"📞 Public URL: {public_url}")
+        print(f"🌐 Extract endpoint: {public_url}/extract")
+        print(f"🔍 Query endpoint: {public_url}/query")
+        print(f"💚 Health check: {public_url}/health")
+        print("="*80 + "\n")
+        
+        atexit.register(cleanup_ngrok)
+        return public_url
+    except Exception as e:
+        error_msg = str(e)
+        print(f"⚠️  Failed to start ngrok tunnel: {error_msg}")
+        
+        # Check if it's a version error
+        if "too old" in error_msg.lower() or "minimum" in error_msg.lower():
+            print("="*80)
+            print("❌ ngrok agent version is too old!")
+            print("💡 Solution: Update pyngrok to the latest version:")
+            print("   pip install --upgrade pyngrok")
+            print("="*80)
+        
+        return None
+
+
+def cleanup_ngrok():
+    """Clean up ngrok tunnel on exit"""
+    global ngrok_tunnel
+    if ngrok_tunnel:
+        try:
+            ngrok.disconnect(ngrok_tunnel.public_url)
+            ngrok.kill()
+            print("✓ ngrok tunnel closed")
+        except Exception as e:
+            print(f"⚠️  Error closing ngrok tunnel: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up ngrok tunnel on shutdown"""
+    cleanup_ngrok()
 
 
 @app.head("/health")
@@ -620,6 +698,51 @@ class CalendarRequest(BaseModel):
     location: str = ""
 
 
+def clean_webhook_url(webhook_url: str) -> str:
+    """
+    Clean and validate webhook URL.
+    
+    Handles cases where the URL has a redirect parameter and extracts the actual endpoint.
+    Example: https://domain.com/?redirect=%2Fapi%2Fwebhook -> https://domain.com/api/webhook
+    
+    Args:
+        webhook_url: The webhook URL to clean
+        
+    Returns:
+        The cleaned webhook URL
+    """
+    if not webhook_url:
+        return webhook_url
+    
+    try:
+        # Parse the URL
+        parsed = urlparse(webhook_url)
+        print(f"  🔍 Parsing webhook URL - scheme: {parsed.scheme}, netloc: {parsed.netloc}, path: {parsed.path}, query: {parsed.query}")
+        
+        # Check if there's a redirect parameter
+        query_params = parse_qs(parsed.query)
+        print(f"  🔍 Query params: {query_params}")
+        
+        if 'redirect' in query_params:
+            # Extract the redirect path
+            redirect_path = unquote(query_params['redirect'][0])
+            print(f"  🔍 Found redirect parameter: {redirect_path}")
+            
+            # Reconstruct the URL without the redirect parameter
+            cleaned_url = f"{parsed.scheme}://{parsed.netloc}{redirect_path}"
+            print(f"  🔧 Cleaned webhook URL: {webhook_url} -> {cleaned_url}")
+            return cleaned_url
+        
+        # If no redirect parameter, return as is
+        print(f"  ℹ️ No redirect parameter found, using original URL")
+        return webhook_url
+    except Exception as e:
+        print(f"  ⚠️ Error cleaning webhook URL: {e}")
+        import traceback
+        traceback.print_exc()
+        return webhook_url
+
+
 def send_webhook_notification(webhook_url: str, job_id: str, job_data: dict, max_retries: int = 3):
     """
     Send webhook notification with retry logic.
@@ -630,14 +753,20 @@ def send_webhook_notification(webhook_url: str, job_id: str, job_data: dict, max
         job_data: Data to send in the webhook
         max_retries: Maximum number of retry attempts
     """
+    # Clean the webhook URL first
+    cleaned_url = clean_webhook_url(webhook_url)
+    print(f"  🔧 Using cleaned URL for request: {cleaned_url}")
+    
     for attempt in range(max_retries):
         try:
             print(f"  📡 Sending webhook notification (attempt {attempt + 1}/{max_retries})...")
+            print(f"  🔍 POST request to: {cleaned_url}")
             response = requests.post(
-                webhook_url,
+                cleaned_url,
                 json=job_data,
                 headers={"Content-Type": "application/json"},
-                timeout=30
+                timeout=30,
+                allow_redirects=False
             )
             response.raise_for_status()
             print(f"  ✓ Webhook notification sent successfully (status: {response.status_code})")
@@ -1551,15 +1680,81 @@ def process_extraction_job(job_id: str, files_data: list, use_ocr: bool, webhook
             extraction_in_progress = False
 
 
-@app.post("/extract", response_model=dict)
-async def upload_pdfs(files: List[UploadFile] = File(...)):
+@app.post("/extract")
+async def extract_text(
+    files: List[UploadFile] = File(...),
+    use_ocr: bool = Form(True),
+    webhook_url: Optional[str] = Form(None)
+):
     """
-    Upload PDF files for processing.
-    Extracts text using OCR, chunks it, creates embeddings, and stores in ChromaDB.
+    Extract text from multiple PDF files and store in ChromaDB.
+    
+    If webhook_url is provided, the extraction will be processed asynchronously
+    and a webhook will be called when complete. Otherwise, it processes synchronously.
+    
+    Args:
+        files: List of PDF files to extract
+        use_ocr: Whether to use OCR for text extraction
+        webhook_url: Optional webhook URL to notify when extraction is complete
     """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    
+    # If webhook_url is provided, process asynchronously
+    if webhook_url:
+        # Generate unique job ID
+        job_id = str(uuid.uuid4())
+        
+        # Read all file contents into memory (required for async processing)
+        files_data = []
+        for file in files:
+            contents = await file.read()
+            files_data.append((file.filename, contents))
+        
+        # Initialize job tracking
+        with job_lock:
+            extraction_jobs[job_id] = {
+                "job_id": job_id,
+                "status": JobStatus.PENDING,
+                "created_at": datetime.now().isoformat(),
+                "total_files": len(files),
+                "use_ocr": use_ocr,
+                "webhook_url": webhook_url,
+                "result": None,
+                "error": None
+            }
+        
+        # Start background processing
+        print(f"\n🔄 Starting async extraction job: {job_id}")
+        print(f"📡 Webhook URL: {webhook_url}")
+        threading.Thread(
+            target=process_extraction_job,
+            args=(job_id, files_data, use_ocr, webhook_url),
+            daemon=True
+        ).start()
+        
+        # Return immediately with job ID
+        return JSONResponse(content={
+            "status": "processing",
+            "job_id": job_id,
+            "message": "Extraction started. You will be notified via webhook when complete.",
+            "webhook_url": webhook_url,
+            "check_status_url": f"/extract/status/{job_id}"
+        })
+    
+    # Synchronous processing (original behavior when no webhook)
+    # Set extraction flag to prevent concurrent backups
+    global extraction_in_progress
+    with extraction_lock:
+        extraction_in_progress = True
+    
     try:
-        if not files:
-            raise HTTPException(status_code=400, detail="No files provided")
+        print("\n" + "="*80)
+        print(f"🚀 Starting batch PDF extraction (synchronous)")
+        print(f"📁 Total files received: {len(files)}")
+        print(f"🔧 OCR enabled: {use_ocr}")
+        print(f"🔧 OCR available: {TESSERACT_FOUND}")
+        print("="*80)
         
         total_chunks = 0
         processed_files = []
@@ -1575,7 +1770,7 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
             pdf_text_dict, page_objects, doc = extract_text_from_pdf(
                 pdf_bytes, 
                 file.filename, 
-                use_ocr=True
+                use_ocr=use_ocr
             )
             
             # Add to ChromaDB
@@ -1590,15 +1785,19 @@ async def upload_pdfs(files: List[UploadFile] = File(...)):
             
             doc.close()
         
-        return {
+        return JSONResponse(content={
             "status": "success",
             "message": f"Processed {len(processed_files)} PDF(s)",
             "total_chunks": total_chunks,
             "files": processed_files
-        }
+        })
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Always reset extraction flag when done
+        with extraction_lock:
+            extraction_in_progress = False
 
 
 @app.get("/extract/status/{job_id}")
@@ -2073,4 +2272,22 @@ if __name__ == "__main__":
     
     # Use PORT environment variable (Cloud Run sets this), default to 8080
     port = int(os.getenv("PORT", "8080"))
+    
+    # Start ngrok tunnel in background thread (non-blocking)
+    def start_ngrok_background():
+        """Start ngrok tunnel in background after a short delay"""
+        time.sleep(2)  # Wait for server to start
+        try:
+            public_url = start_ngrok_tunnel(port)
+            if public_url:
+                print(f"🎉 Service is accessible via ngrok at: {public_url}")
+        except Exception as e:
+            print(f"⚠️  Failed to start ngrok tunnel: {e}")
+            print("⚠️  Continuing without ngrok. Service will only be accessible locally.")
+    
+    # Start ngrok in background thread
+    if PYNGROK_AVAILABLE:
+        threading.Thread(target=start_ngrok_background, daemon=True).start()
+    
+    print(f"🚀 Starting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
