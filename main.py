@@ -2094,6 +2094,19 @@ async def list_pdfs():
     Returns information about each PDF including name, page count, and total characters.
     """
     try:
+        # Ensure models are initialized (lazy initialization)
+        ensure_models_initialized()
+        
+        global collection
+        if collection is None:
+            print("  ⚠ ChromaDB collection not initialized")
+            return JSONResponse(content={
+                "status": "error",
+                "message": "ChromaDB collection not initialized",
+                "total_pdfs": 0,
+                "pdfs": []
+            })
+        
         print("\n" + "="*80)
         print(f"📋 Listing all PDFs in ChromaDB...")
         print("="*80)
@@ -2172,6 +2185,16 @@ async def delete_pdf(pdf_name: str, delete_s3_images: bool = False):
         Information about what was deleted
     """
     try:
+        # Ensure models are initialized (lazy initialization)
+        ensure_models_initialized()
+        
+        global collection
+        if collection is None:
+            raise HTTPException(
+                status_code=500,
+                detail="ChromaDB collection not initialized"
+            )
+        
         print("\n" + "="*80)
         print(f"🗑️  Deleting PDF: {pdf_name}")
         print(f"   Delete S3 images: {delete_s3_images}")
