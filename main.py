@@ -155,7 +155,7 @@ if sys.platform == 'win32':
 else:
     TESSERACT_FOUND = True
 
-# Initialize FastAPI
+# Initialize FastAPI.
 app = FastAPI(
     title="PDF Text Extraction & Query API with WhatsApp",
     description="Extract text from PDFs, store in ChromaDB, query with GPT-4o, and send via WhatsApp",
