@@ -517,9 +517,27 @@ def ensure_models_initialized():
         try:
             print("🚀 Initializing models (lazy initialization)...")
             
-            # Initialize embedding model
-            embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            print("✅ Embedding model loaded")
+            # Initialize embedding model with timeout
+            print("  📥 Loading SentenceTransformer model (all-MiniLM-L6-v2)...")
+            print("     (This may take 30-60s on first run to download ~80MB model)")
+            
+            import concurrent.futures
+            
+            def load_model():
+                return SentenceTransformer('all-MiniLM-L6-v2')
+            
+            # Use ThreadPoolExecutor with timeout for model loading
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(load_model)
+                try:
+                    embedding_model = future.result(timeout=180)  # 3 minute timeout for model download
+                    print("✅ Embedding model loaded")
+                except concurrent.futures.TimeoutError:
+                    print("❌ Model loading timed out after 180 seconds")
+                    raise Exception("Model loading timed out. This usually happens on slow connections or CPU throttling.")
+                except Exception as model_error:
+                    print(f"❌ Model loading failed: {str(model_error)}")
+                    raise
             
             # Initialize collection if ChromaDB client is available
             if chroma_client is not None:
