@@ -25,7 +25,7 @@ except ImportError:
     print("⚠️  pyngrok not found. Install with: pip install pyngrok")
 
 try:
-    import fitz  # PyMuPDF.
+    import fitz  # PyMuPDF..
 except ImportError:
     print("PyMuPDF not found. Please install it using:")
     print("  pip install pymupdf")
