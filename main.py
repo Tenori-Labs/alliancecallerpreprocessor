@@ -25,7 +25,7 @@ except ImportError:
     print("⚠️  pyngrok not found. Install with: pip install pyngrok")
 
 try:
-    import fitz  # PyMuPDF..
+    import fitz  # PyMuPDF.
 except ImportError:
     print("PyMuPDF not found. Please install it using:")
     print("  pip install pymupdf")
@@ -50,16 +50,9 @@ except ImportError:
 try:
     from sentence_transformers import SentenceTransformer
 except ImportError:
-    print("sentence-transformers not found. Installing automatically...")
-    import subprocess
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "sentence-transformers"])
-        print("✓ sentence-transformers installed successfully")
-        from sentence_transformers import SentenceTransformer
-    except subprocess.CalledProcessError:
-        print("✗ Failed to install sentence-transformers automatically.")
-        print("Please install it manually using: pip install sentence-transformers")
-        sys.exit(1)
+    print("✗ sentence-transformers not found.")
+    print("Please install it using: pip install sentence-transformers")
+    sys.exit(1)
 
 try:
     import numpy as np
@@ -155,7 +148,7 @@ if sys.platform == 'win32':
 else:
     TESSERACT_FOUND = True
 
-# Initialize FastAPI.
+# Initialize FastAPI
 app = FastAPI(
     title="PDF Text Extraction & Query API with WhatsApp",
     description="Extract text from PDFs, store in ChromaDB, query with GPT-4o, and send via WhatsApp",
@@ -261,12 +254,13 @@ async def shutdown_event():
 
 
 @app.head("/health")
+@app.get("/health")
 async def health_check():
     """
-    Health check endpoint (HEAD request).
+    Health check endpoint (HEAD or GET request).
     Returns 200 OK if the service is running.
     """
-    return None
+    return {"status": "ok"}
 
 
 # Google Calendar configuration
@@ -290,14 +284,21 @@ aws_region = os.getenv("AWS_REGION", "ap-south-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "alliancewidget")
 
 def get_bucket_region(bucket_name, access_key, secret_key, default_region):
-    """Get the actual region of an S3 bucket."""
+    """Get the actual region of an S3 bucket with timeout."""
     try:
-        # Create a temporary client with default region to get bucket location
+        from botocore.config import Config
+        # Create a temporary client with timeout to avoid blocking startup
+        config = Config(
+            connect_timeout=5,
+            read_timeout=5,
+            retries={'max_attempts': 1}
+        )
         temp_client = boto3.client(
             's3',
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            region_name=default_region
+            region_name=default_region,
+            config=config
         )
         # Get bucket location (returns 'us-east-1' as None or the actual region)
         response = temp_client.get_bucket_location(Bucket=bucket_name)
@@ -313,7 +314,7 @@ def get_bucket_region(bucket_name, access_key, secret_key, default_region):
             print(f"  ⚠ Could not detect bucket region ({error_code}), using configured: {default_region}")
             return default_region
         # For other errors, try common regions
-        print(f"  ⚠ Error detecting bucket region: {e}")
+        print(f"  ⚠ Error detecting bucket region: {e}, using configured: {default_region}")
         return default_region
     except Exception as e:
         print(f"  ⚠ Could not detect bucket region: {e}, using configured: {default_region}")
