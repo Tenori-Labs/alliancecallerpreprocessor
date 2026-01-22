@@ -394,20 +394,36 @@ _models_init_lock = threading.Lock()
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 100
 
-# Download ChromaDB from S3 in background thread (non-blocking)
-def download_chromadb_background():
-    """Download ChromaDB from S3 in background thread."""
+# Download ChromaDB from S3 synchronously FIRST (before initializing ChromaDB)
+# This ensures permissions are fixed before ChromaDB tries to access the database
+print("📥 Downloading ChromaDB from S3 (if available)...")
+try:
+    download_chromadb_from_s3()
+    print("✅ ChromaDB download from S3 completed")
+except Exception as e:
+    print(f"⚠️ Error downloading ChromaDB from S3: {e}")
+    print("  → Continuing with empty ChromaDB (this is normal for first run)")
+
+# Ensure permissions are correct after download (in case files were extracted)
+if os.path.exists(CHROMADB_LOCAL_PATH):
     try:
-        print("📥 Starting ChromaDB download from S3 in background...")
-        download_chromadb_from_s3()
-        print("✅ ChromaDB download from S3 completed")
+        print("🔧 Ensuring ChromaDB directory has correct permissions...")
+        for root, dirs, files in os.walk(CHROMADB_LOCAL_PATH):
+            for d in dirs:
+                try:
+                    os.chmod(os.path.join(root, d), 0o755)
+                except:
+                    pass
+            for f in files:
+                try:
+                    os.chmod(os.path.join(root, f), 0o644)
+                except:
+                    pass
+        print("  ✓ Permissions verified")
     except Exception as e:
-        print(f"⚠️ Error downloading ChromaDB from S3: {e}")
+        print(f"  ⚠️  Warning: Could not verify permissions: {e}")
 
-# Start ChromaDB download in background thread (non-blocking)
-threading.Thread(target=download_chromadb_background, daemon=True).start()
-
-# Initialize ChromaDB at module level (fast, non-blocking)
+# Initialize ChromaDB AFTER download and permission fixes
 try:
     chroma_client = chromadb.PersistentClient(
         path=CHROMADB_LOCAL_PATH,
@@ -424,7 +440,7 @@ except Exception as e:
 
 def ensure_models_initialized():
     """Ensure models are initialized (lazy initialization)."""
-    global embedding_model, collection, _models_initialized
+    global embedding_model, collection, _models_initialized, chroma_client
     
     if _models_initialized:
         return
@@ -487,14 +503,30 @@ def ensure_models_initialized():
                                 print(f"⚠️  Permission fix failed: {retry_error}")
                                 print("  🔄 Deleting and recreating collection...")
                                 try:
-                                    chroma_client.delete_collection(name="pdf_documents")
-                                except:
-                                    pass
-                                collection = chroma_client.create_collection(
-                                    name="pdf_documents",
-                                    metadata={"hnsw:space": "cosine"}
-                                )
-                                print("✅ Collection recreated")
+                                    # Close the client first
+                                    chroma_client = None
+                                    # Delete the entire database directory and recreate
+                                    if os.path.exists(CHROMADB_LOCAL_PATH):
+                                        print("  🗑️  Removing readonly database directory...")
+                                        shutil.rmtree(CHROMADB_LOCAL_PATH)
+                                    os.makedirs(CHROMADB_LOCAL_PATH, exist_ok=True, mode=0o755)
+                                    # Reinitialize client
+                                    chroma_client = chromadb.PersistentClient(
+                                        path=CHROMADB_LOCAL_PATH,
+                                        settings=Settings(
+                                            anonymized_telemetry=False,
+                                            allow_reset=True
+                                        )
+                                    )
+                                    # Create new collection
+                                    collection = chroma_client.create_collection(
+                                        name="pdf_documents",
+                                        metadata={"hnsw:space": "cosine"}
+                                    )
+                                    print("✅ Database recreated with proper permissions")
+                                except Exception as recreate_error:
+                                    print(f"⚠️  Failed to recreate database: {recreate_error}")
+                                    raise
                         elif "dimension" in error_msg.lower() or "1536" in error_msg or "384" in error_msg:
                             print(f"🔄 Collection has wrong embedding dimension. Resetting...")
                             try:
@@ -511,27 +543,51 @@ def ensure_models_initialized():
                 except Exception as e:
                     error_msg = str(e)
                     if "readonly" in error_msg.lower() or "read-only" in error_msg.lower() or "read only" in error_msg.lower() or "code: 1032" in error_msg:
-                        print(f"⚠️  Database is readonly. Fixing permissions and recreating collection...")
-                        # Fix permissions
+                        print(f"⚠️  Database is readonly. Fixing permissions and recreating database...")
+                        # Fix permissions first
                         try:
                             if os.path.exists(CHROMADB_LOCAL_PATH):
                                 for root, dirs, files in os.walk(CHROMADB_LOCAL_PATH):
                                     for d in dirs:
-                                        os.chmod(os.path.join(root, d), 0o755)
+                                        try:
+                                            os.chmod(os.path.join(root, d), 0o755)
+                                        except:
+                                            pass
                                     for f in files:
-                                        os.chmod(os.path.join(root, f), 0o644)
+                                        try:
+                                            os.chmod(os.path.join(root, f), 0o644)
+                                        except:
+                                            pass
                         except Exception as perm_error:
                             print(f"  ⚠️  Could not fix permissions: {perm_error}")
-                        # Delete and recreate collection
+                        
+                        # If permission fix doesn't work, delete and recreate entire database
                         try:
-                            chroma_client.delete_collection(name="pdf_documents")
-                        except:
-                            pass
-                        collection = chroma_client.create_collection(
-                            name="pdf_documents",
-                            metadata={"hnsw:space": "cosine"}
-                        )
-                        print("✅ Collection recreated with proper permissions")
+                            # Close the client first
+                            chroma_client = None
+                            # Delete the entire database directory
+                            if os.path.exists(CHROMADB_LOCAL_PATH):
+                                print("  🗑️  Removing readonly database directory...")
+                                shutil.rmtree(CHROMADB_LOCAL_PATH)
+                            # Recreate directory with proper permissions
+                            os.makedirs(CHROMADB_LOCAL_PATH, exist_ok=True, mode=0o755)
+                            # Reinitialize client
+                            chroma_client = chromadb.PersistentClient(
+                                path=CHROMADB_LOCAL_PATH,
+                                settings=Settings(
+                                    anonymized_telemetry=False,
+                                    allow_reset=True
+                                )
+                            )
+                            # Create new collection
+                            collection = chroma_client.create_collection(
+                                name="pdf_documents",
+                                metadata={"hnsw:space": "cosine"}
+                            )
+                            print("✅ Database recreated with proper permissions")
+                        except Exception as recreate_error:
+                            print(f"⚠️  Failed to recreate database: {recreate_error}")
+                            raise
                     elif "not found" in error_msg.lower() or "does not exist" in error_msg.lower():
                         collection = chroma_client.create_collection(
                             name="pdf_documents",
